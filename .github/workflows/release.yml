@@ -97,7 +97,7 @@ jobs:
           if ($remoteActual -ne $remoteExpected -or $remoteActual -ne $expected) { throw 'Published installer checksum mismatch' }
           gh release edit $tag --latest --title "Artificial Inventor $version" --notes-file docs/RELEASE_NOTES.md
           if ($LASTEXITCODE -ne 0) { throw 'Could not finalize the release' }
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: windows-build
