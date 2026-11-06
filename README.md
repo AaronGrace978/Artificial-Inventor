@@ -1,6 +1,6 @@
 # Artificial Inventor
 
-<img width="1917" height="1007" alt="image" src="https://github.com/user-attachments/assets/e4e69e55-1bf7-49ea-9662-aae27936f3f8" />
+<img width="1919" height="999" alt="image" src="https://github.com/user-attachments/assets/2b423d84-0f7e-45fe-853a-eb2dcb6d653d" />
 
 A Windows Electron workbench for **building code projects and running bounded design experiments**. Version 0.2 adds Build studio: streamed model generation, inspectable source files, static checks, isolated browser previews, and project export. The thermal Research lab retains deterministic heat-sink search, conventional baselines, separate numerical calculations, sensitivity checks, and an exportable evidence ledger.
 
