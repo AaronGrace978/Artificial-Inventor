@@ -1,0 +1,68 @@
+name: Maintain current Electron
+on:
+  schedule:
+    - cron: '23 8 * * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: stable-release-publisher
+  cancel-in-progress: false
+jobs:
+  refresh:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: Check the latest stable runtime
+        id: runtime
+        shell: pwsh
+        run: |
+          $current = (Get-Content package.json | ConvertFrom-Json).devDependencies.electron
+          $latest = npm view electron version
+          if ($LASTEXITCODE -ne 0) { throw 'Could not resolve the stable Electron release' }
+          if ($current -eq $latest.Trim()) { 'changed=false' >> $env:GITHUB_OUTPUT }
+          else { 'changed=true' >> $env:GITHUB_OUTPUT; "version=$($latest.Trim())" >> $env:GITHUB_OUTPUT }
+      - if: steps.runtime.outputs.changed == 'true'
+        run: npm ci
+      - if: steps.runtime.outputs.changed == 'true'
+        run: npm install --save-dev --save-exact electron@${{ steps.runtime.outputs.version }}
+      - if: steps.runtime.outputs.changed == 'true'
+        run: npm run check
+      - if: steps.runtime.outputs.changed == 'true'
+        run: npm test
+      - if: steps.runtime.outputs.changed == 'true'
+        run: npm run test:ui
+      - name: Prepare patch release
+        if: steps.runtime.outputs.changed == 'true'
+        run: npm version patch --no-git-tag-version
+      - name: Build before changing the release branch
+        if: steps.runtime.outputs.changed == 'true'
+        run: npm run dist:win -- --publish never
+        env:
+          CSC_LINK: ${{ secrets.WINDOWS_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.WINDOWS_CSC_KEY_PASSWORD }}
+      - name: Publish tested runtime upgrade
+        if: steps.runtime.outputs.changed == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $version = (Get-Content package.json | ConvertFrom-Json).version
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add package.json package-lock.json
+          git commit -m "Update Electron to ${{ steps.runtime.outputs.version }} (v$version)"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not commit runtime upgrade' }
+          git tag "v$version"
+          git push --atomic origin HEAD:main "v$version"
+          if ($LASTEXITCODE -ne 0) { throw 'Branch changed or permissions prevent release; refusing to publish stale build' }
+          $assets = Get-ChildItem dist/*.exe,dist/*.blockmap,dist/latest.yml | ForEach-Object { $_.FullName }
+          gh release create "v$version" @assets --title "Artificial Inventor $version" --notes "Tested Electron runtime update to ${{ steps.runtime.outputs.version }}. Includes Windows x64 installer and automatic update metadata. See README for signing and verification limits."
+          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed; rerun Windows release for this tag' }

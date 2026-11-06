@@ -1,0 +1,40 @@
+{
+  "name": "artificial-inventor",
+  "version": "0.1.0",
+  "description": "A bounded research workbench with evidence-gated AI proposals",
+  "private": true,
+  "type": "module",
+  "main": "src/main.js",
+  "author": "Artificial Inventor contributors",
+  "license": "UNLICENSED",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron .",
+    "test": "node --test --test-isolation=none test/*.test.js",
+    "test:ui": "playwright test",
+    "check": "node scripts/check.mjs",
+    "dist:win": "electron-builder --win nsis --x64",
+    "pack": "electron-builder --dir",
+    "release:win": "electron-builder --win nsis --x64 --publish always"
+  },
+  "dependencies": {
+    "electron-updater": "6.8.11"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.65.0",
+    "electron": "45.2.3",
+    "electron-builder": "26.18.0"
+  },
+  "build": {
+    "appId": "com.artificialinventor.workbench",
+    "productName": "Artificial Inventor",
+    "asar": true,
+    "files": ["src/**/*", "resources/icon.png", "package.json"],
+    "directories": { "output": "dist" },
+    "publish": [{ "provider": "github", "owner": "AaronGrace978", "repo": "Artificial-Inventor-", "releaseType": "release" }],
+    "win": { "icon": "resources/icon.ico", "target": [{ "target": "nsis", "arch": ["x64"] }], "artifactName": "Artificial-Inventor-Setup-${version}-${arch}.${ext}" },
+    "nsis": { "oneClick": false, "allowToChangeInstallationDirectory": true, "perMachine": false, "deleteAppDataOnUninstall": false },
+    "linux": { "target": "dir", "category": "Science" }
+  }
+}
