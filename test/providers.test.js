@@ -233,6 +233,56 @@ function streamingResponse(frames, type = 'application/x-ndjson') {
   } }), { headers: { 'content-type': type } });
 }
 
+test('Build Studio accepts Ollama streams labeled as JSON, plain text, or without a content type', async () => {
+  const project = { title: 'Counter', summary: 'A working counter', files: [{ path: 'index.html', content: '<button>Count ☀</button>' }] };
+  const raw = JSON.stringify(project);
+  for (const type of ['application/json', 'text/plain', '']) {
+    const progress = [];
+    const result = await generateProject({ providerId: 'ollama', model: 'kimi-k3.1-pro', key: 'test-key', objective: 'Build a counter', onProgress: event => progress.push(event) }, {
+      fetchImpl: async () => streamingResponse([
+        JSON.stringify({ message: { thinking: 'private reasoning', content: '' }, done: false }),
+        JSON.stringify({ message: { content: raw.slice(0, 55) }, done: false }),
+        JSON.stringify({ message: { content: raw.slice(55) }, done: false }),
+        JSON.stringify({ message: { content: '' }, done: true, done_reason: 'stop' }),
+      ], type),
+    });
+    assert.deepEqual(result.project, project);
+    assert.ok(progress.some(event => event.status === 'thinking'));
+    assert.ok(progress.some(event => event.status === 'generating'));
+    assert.ok(!JSON.stringify(progress).includes('private reasoning'));
+  }
+});
+
+test('mislabeled streams still require completion and reject provider errors and output limits', async () => {
+  const raw = JSON.stringify({ proposals: [valid] });
+  for (const [tail, code] of [
+    [[], 'INCOMPLETE_RESPONSE'],
+    [[{ done: true, done_reason: 'length' }], 'INCOMPLETE_RESPONSE'],
+    [[{ error: 'private provider detail' }], 'STREAM_ERROR'],
+  ]) {
+    await assert.rejects(generateProposals({ providerId: 'ollama', model: 'kimi-k3.1-pro', key: 'test-key', spec: {} }, {
+      fetchImpl: async () => streamingResponse([
+        JSON.stringify({ message: { content: raw }, done: false }), ...tail.map(event => JSON.stringify(event)),
+      ], 'application/json'),
+    }), error => error.code === code && !error.message.includes('private provider detail'));
+  }
+});
+
+test('SSE framing is recognized with a JSON header and ordinary pretty JSON remains supported', async () => {
+  const raw = JSON.stringify({ proposals: [valid] });
+  const result = await generateProposals({ providerId: 'deepseek', model: 'model', key: 'test-key', spec: {} }, {
+    fetchImpl: async () => streamingResponse([
+      `data: ${JSON.stringify({ choices: [{ delta: { content: raw }, finish_reason: 'stop' }] })}\n`,
+      'data: [DONE]\n',
+    ], 'application/json'),
+  });
+  assert.deepEqual(result.proposals, [valid]);
+  const ordinary = await generateProposals({ providerId: 'ollama', model: 'model', key: 'test-key', spec: {} }, {
+    fetchImpl: async () => new Response(JSON.stringify({ message: { content: raw }, done: true }, null, 2), { headers: { 'content-type': 'application/json' } }),
+  });
+  assert.deepEqual(ordinary.proposals, [valid]);
+});
+
 test('reasoning requests have explicit longer deadlines and receive only sanitized progress', async () => {
   assert.equal(PROPOSAL_TIMEOUT_MS, 300_000);
   assert.equal(PROJECT_TIMEOUT_MS, 600_000);

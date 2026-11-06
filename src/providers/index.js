@@ -178,12 +178,32 @@ async function requestJSON(provider, path, key, { method = 'GET', body, signal, 
     }
     let text = '';
     const contentType = response.headers?.get('content-type') || '';
-    const ndjson = streaming && /(?:ndjson|jsonl)/i.test(contentType);
+    let ndjson = streaming && /(?:ndjson|jsonl)/i.test(contentType);
     const eventStream = streaming && /text\/event-stream/i.test(contentType);
-    const parser = ndjson || eventStream ? streamState(provider, progress) : null;
+    let parser = ndjson || eventStream ? streamState(provider, progress) : null;
     let buffer = '';
     const consume = (value, final = false) => {
-      if (!parser) { text += value; return; }
+      if (!parser) {
+        text += value;
+        // Gateways can label streamed bodies as application/json (or omit the
+        // header). Inspect framing, never generated content inside an envelope.
+        if (!streaming) return;
+        const probe = text.trimStart();
+        const firstLine = probe.split(/\r?\n/, 1)[0];
+        const sse = /^(?:data:|event:|:)/.test(probe);
+        let ollamaFrame = false;
+        if (provider.kind === 'ollama' && (probe.includes('\n') || final)) {
+          try {
+            const frame = JSON.parse(firstLine);
+            ollamaFrame = typeof frame?.done === 'boolean' && !Array.isArray(frame);
+          } catch { /* A pretty-printed JSON response is not a stream frame. */ }
+        }
+        if (!sse && !ollamaFrame) return;
+        ndjson = ollamaFrame;
+        parser = streamState(provider, progress);
+        value = text;
+        text = '';
+      }
       buffer += value;
       const separator = ndjson ? /\r?\n/ : /\r?\n\r?\n/;
       const frames = buffer.split(separator);
