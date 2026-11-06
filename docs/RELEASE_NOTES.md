@@ -1,3 +1,16 @@
+# 0.3.0 — Build Studio and product visualization
+
+Build Studio now builds in stages: plan the project, generate individual files, run independent source checks and isolated browser interaction tests, then repair failures within an explicit budget. Completed files are checkpointed so interrupted builds can resume without repeating successful steps.
+
+- Up to six source files and two repairs, with at most nine provider calls per attempt. Failed provider calls stop rather than silently retrying.
+- Separate total time and per-call output allowances, clearer token-limit versus interrupted-stream diagnostics, and visible build activity.
+- Product visualizer mode for interactive SVG/Canvas concepts, including dimensions, materials, views, component labels and assembly exploration.
+- An offline Forma lamp concept demonstrates working proportions, finish, view, exploded-assembly and wireframe controls.
+- Save the current SVG illustration through an explicit host dialog without granting previews access to application credentials or files.
+- Preserve check reports, provenance, project export and the existing Research lab/evidence workflow.
+
+Validation: JavaScript checks, 78 unit tests, five Electron integration tests, and a packaged Linux app smoke test passed in development. The Windows release workflow runs checks and tests again before publishing the x64 installer and checksum-verified update assets. Live authenticated Ollama generation remains unverified in this development environment because provider network access is blocked. Concept illustrations are not manufacturing CAD, photorealistic renders, or physical validation; code projects do not run native toolchains inside the app.
+
 # 0.2.1
 
 Fix Build studio project generation failing with "Provider returned an invalid JSON response" when an Ollama Cloud stream is labeled as ordinary JSON or has no content type. Detect Ollama NDJSON and other providers' SSE framing from incoming data while retaining support for complete ordinary JSON responses.

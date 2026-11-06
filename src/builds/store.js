@@ -15,11 +15,11 @@ function provenance(input = {}) {
 
 export class ProjectStore {
   constructor(directory) { this.directory = path.resolve(directory); }
-  async save(input, { objective = '', generator = {}, kind = 'web-app' } = {}) {
+  async save(input, { objective = '', generator = {}, buildReport, kind = 'web-app' } = {}) {
     if (typeof objective !== 'string' || objective.length > 6000) throw new Error('Build objective must be at most 6000 characters.');
     const project = validateProject(input, { kind });
     const record = { ...project, id: randomUUID(), createdAt: new Date().toISOString(), version: 1, kind, objective,
-      generator: provenance(generator), verification: await verifyProjectInWorker(project, kind),
+      generator: provenance(generator), ...(buildReport ? { buildReport } : {}), verification: await verifyProjectInWorker(project, kind),
       artifacts: project.files.map(file => ({ path: file.path, sha256: hash(file.content), bytes: Buffer.byteLength(file.content, 'utf8') })) };
     await mkdir(this.directory, { recursive: true, mode: 0o700 });
     const temporary = path.join(this.directory, `${record.id}.tmp`);
@@ -39,7 +39,7 @@ export class ProjectStore {
     if (!Array.isArray(record.artifacts) || project.files.some(file => !record.artifacts.some(artifact => artifact && artifact.path === file.path && artifact.sha256 === hash(file.content)))) throw new Error('Saved project content does not match its artifact hashes.');
     return { ...project, id, createdAt: record.createdAt, version: 1, kind: record.kind, objective: record.objective,
       artifacts: project.files.map(file => ({ path: file.path, sha256: hash(file.content), bytes: Buffer.byteLength(file.content, 'utf8') })),
-      generator: provenance(record.generator), verification: await verifyProjectInWorker(project, record.kind) };
+      generator: provenance(record.generator), ...(record.buildReport ? { buildReport: record.buildReport } : {}), verification: await verifyProjectInWorker(project, record.kind) };
   }
   async list({ limit = 50 } = {}) {
     if (!Number.isInteger(limit) || limit < 1 || limit > 200) throw new Error('Invalid project listing limit.');

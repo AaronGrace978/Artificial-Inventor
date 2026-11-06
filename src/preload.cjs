@@ -11,6 +11,7 @@ contextBridge.exposeInMainWorld('inventor', Object.freeze({
   cancelBuild: () => invoke('inventor:cancel-build'),
   listProjects: () => invoke('inventor:projects'),
   previewProject: id => invoke('inventor:preview-project', id),
+  exportVisual: input => invoke('inventor:export-visual', input),
   exportProject: id => invoke('inventor:export-project', id),
   listEvidence: () => invoke('inventor:evidence'),
   exportEvidence: runId => invoke('inventor:export', runId),

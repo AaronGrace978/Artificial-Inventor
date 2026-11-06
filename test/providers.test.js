@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { listProviders, discoverModels, generateProposals, parseProposals, generateProject, parseProject, PROPOSAL_TIMEOUT_MS, PROJECT_TIMEOUT_MS } from '../src/providers/index.js';
+import { listProviders, discoverModels, generateProposals, parseProposals, generateProject, generateBuildStep, parseProject, PROPOSAL_TIMEOUT_MS, PROJECT_TIMEOUT_MS } from '../src/providers/index.js';
 
 const valid = { finCount: 12, finHeightMm: 30, finThicknessMm: 1.2, baseThicknessMm: 3, rationale: 'A hypothesis, not a measured result.' };
 const json = data => new Response(JSON.stringify(data), { status: 200, headers: { 'Content-Type': 'application/json' } });
@@ -403,7 +403,7 @@ test('project generation returns actual bounded files rather than executable aut
   const result = await generateProject({ providerId: 'ollama', model: 'reasoning-pro', key: 'private-test-token', objective: 'Build a counter', kind: 'web-app', onProgress: event => progress.push(event) }, {
     fetchImpl: async (_url, options) => {
       const body = JSON.parse(options.body);
-      assert.equal(body.options.num_predict, 12000);
+      assert.equal(body.options.num_predict, 32000);
       assert(body.messages[1].content.includes('Build a counter'));
       assert.equal(body.stream, true);
       return streamingResponse([JSON.stringify({ message: { content: JSON.stringify(project) }, done: true })]);
@@ -424,4 +424,75 @@ test('project artifacts redact an echoed provider key from every returned text f
   const result = await generateProject({ providerId: 'openai', model: 'model', key: secret, objective: 'Build an app' }, { fetchImpl: async () => json({ output_text: JSON.stringify(project) }) });
   assert(!JSON.stringify(result).includes(secret));
   assert(result.project.files[0].content.includes('[redacted]'));
+});
+
+
+test('project output allowances reach each provider without automatic retries', async () => {
+  const project = { title: 'Complete', summary: 'Small app', files: [{ path: 'index.html', content: '<p>Ready</p>' }] };
+  for (const provider of listProviders()) {
+    for (const maxOutputTokens of [12000, 32000, 64000]) {
+      let calls = 0;
+      await generateProject({ providerId: provider.id, model: 'model', key: 'test-key', objective: 'Small app', maxOutputTokens }, {
+        fetchImpl: async (_url, options) => {
+          calls++;
+          const body = JSON.parse(options.body);
+          assert.equal(body.options?.num_predict ?? body.max_output_tokens ?? body.max_tokens ?? body.generationConfig?.maxOutputTokens, maxOutputTokens, provider.id);
+          const raw = JSON.stringify(project);
+          if (provider.id === 'openai') return json({ output_text: raw });
+          if (provider.id === 'anthropic') return json({ content: [{ type: 'text', text: raw }] });
+          if (provider.id === 'google') return json({ candidates: [{ content: { parts: [{ text: raw }] } }] });
+          if (provider.id === 'ollama') return json({ message: { content: raw }, done: true });
+          return json({ choices: [{ message: { content: raw }, finish_reason: 'stop' }] });
+        }
+      });
+      assert.equal(calls, 1);
+    }
+  }
+  for (const maxOutputTokens of [0, -1, 128000, '32000', null, NaN]) {
+    await assert.rejects(generateProject({ providerId: 'ollama', model: 'model', key: 'test-key', objective: 'Small app', maxOutputTokens }, { fetchImpl: () => { throw new Error('Must not send an invalid budget'); } }), { code: 'INVALID_OUTPUT_LIMIT' });
+  }
+});
+
+test('token exhaustion and an interrupted stream have distinct recovery advice', async () => {
+  const cases = [
+    ['ollama', [{ message: { thinking: 'private' }, done: false }, { done: true, done_reason: 'length' }]],
+    ['openai', [{ type: 'response.incomplete', response: { incomplete_details: { reason: 'max_output_tokens' } } }]],
+    ['anthropic', [{ type: 'message_delta', delta: { stop_reason: 'max_tokens' } }, { type: 'message_stop' }]],
+    ['google', [{ candidates: [{ finishReason: 'MAX_TOKENS' }] }]],
+    ['deepseek', [{ choices: [{ delta: {}, finish_reason: 'length' }] }]],
+  ];
+  for (const [providerId, events] of cases) {
+    let calls = 0;
+    await assert.rejects(generateProject({ providerId, model: 'reasoning', key: 'test-key', objective: 'Small app' }, { fetchImpl: async () => {
+      calls++;
+      return streamingResponse(events.map(event => providerId === 'ollama' ? JSON.stringify(event) : `data: ${JSON.stringify(event)}\n`), providerId === 'ollama' ? 'application/x-ndjson' : 'text/event-stream');
+    } }), error => error.code === 'INCOMPLETE_RESPONSE' && /output token limit/.test(error.message) && /time limit alone/.test(error.message));
+    assert.equal(calls, 1);
+  }
+  await assert.rejects(generateProject({ providerId: 'ollama', model: 'model', key: 'test-key', objective: 'Small app' }, { fetchImpl: async () => streamingResponse(['{"message":{"content":"{}"},"done":false}']) }), error => error.code === 'INCOMPLETE_RESPONSE' && /without confirming/.test(error.message) && !/reached its output token limit/.test(error.message));
+});
+
+test('reasoning stream overhead can exceed catalog limits while text and wire remain bounded', async () => {
+  const project = { title: 'Complete', summary: 'Small app', files: [{ path: 'index.html', content: '<p>Ready</p>' }] };
+  const result = await generateProject({ providerId: 'ollama', model: 'model', key: 'test-key', objective: 'Small app' }, { fetchImpl: async () => new Response([
+    ...Array.from({ length: 2200 }, () => JSON.stringify({ message: { thinking: 'x'.repeat(1000) }, done: false })),
+    JSON.stringify({ message: { content: JSON.stringify(project) }, done: true, done_reason: 'stop' })
+  ].join('\n'), { headers: { 'content-type': 'application/x-ndjson' } }) });
+  assert.deepEqual(result.project, project);
+  for (const response of [
+    () => new Response('{}', { headers: { 'content-length': String(16 * 1024 * 1024 + 1) } }),
+    () => new Response(JSON.stringify({ message: { content: 'x'.repeat(1_100_001) }, done: true }), { headers: { 'content-type': 'application/x-ndjson' } }),
+  ]) await assert.rejects(generateProject({ providerId: 'ollama', model: 'model', key: 'test-key', objective: 'Small app' }, { fetchImpl: async () => response() }), { code: 'RESPONSE_TOO_LARGE' });
+});
+
+
+test('harness source steps support raw code on Gemini and redact credentials', async () => {
+  const secret = 'temporary-test-auth-token';
+  const result = await generateBuildStep({ providerId: 'google', model: 'test-model', key: secret, systemPrompt: 'Return source', prompt: 'Write app.js' }, { fetchImpl: async (_url, options) => {
+    const body = JSON.parse(options.body);
+    assert.equal(body.generationConfig.responseMimeType, undefined);
+    return json({ candidates: [{ content: { parts: [{ text: `// ${secret}\nconst value=1;` }] }, finishReason: 'STOP' }] });
+  } });
+  assert(!result.includes(secret));
+  assert.match(result, /const value=1/);
 });
