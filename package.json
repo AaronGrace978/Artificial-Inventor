@@ -1,6 +1,6 @@
 {
   "name": "artificial-inventor",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "A bounded research workbench with evidence-gated AI proposals",
   "private": true,
   "type": "module",

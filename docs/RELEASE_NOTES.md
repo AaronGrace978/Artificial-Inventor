@@ -1,3 +1,11 @@
+# 0.2.1
+
+Fix Build studio project generation failing with "Provider returned an invalid JSON response" when an Ollama Cloud stream is labeled as ordinary JSON or has no content type. Detect Ollama NDJSON and other providers' SSE framing from incoming data while retaining support for complete ordinary JSON responses.
+
+Reasoning remains separate from project files. Completion checks, output limits, cancellation, total deadlines, and response-size bounds remain in place. The selected model is unchanged and paid requests are not retried automatically.
+
+Provider regression tests cover project-file generation from mislabeled streams, multibyte text, reasoning separation, provider errors, and incomplete or truncated responses. Live authenticated Ollama generation has not been independently verified.
+
 # 0.2.0
 
 Build studio now generates and exports real multi-file code projects. Static browser apps can run in an operator-started isolated preview; other supported source languages are exported with explicit validation limits. A working offline Idea Board demonstrates file inspection, preview interaction and export.
