@@ -3,6 +3,12 @@ on:
   push:
     tags: ['v*']
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      release_ref:
+        type: string
+        required: false
+        default: ''
 permissions:
   contents: write
 concurrency:
@@ -13,6 +19,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_ref || github.ref }}
       - uses: actions/setup-node@v7
         with:
           node-version: 24
@@ -26,12 +34,43 @@ jobs:
       - run: npm run check
       - run: npm test
       - run: npm run test:ui
-      - name: Build and publish Windows installer and update metadata
-        run: npm run release:win
+      - name: Build Windows installer and update metadata
+        run: npm run dist:win -- --publish never
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CSC_LINK: ${{ secrets.WINDOWS_CSC_LINK }}
           CSC_KEY_PASSWORD: ${{ secrets.WINDOWS_CSC_KEY_PASSWORD }}
+      - name: Publish and verify complete release assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $version = (Get-Content package.json | ConvertFrom-Json).version
+          $tag = "v$version"
+          $installer = "Artificial-Inventor-Setup-$version-x64.exe"
+          foreach ($file in @("dist/$installer", 'dist/latest.yml')) {
+            if (!(Test-Path $file)) { throw "Required release asset missing: $file" }
+          }
+          $metadata = Get-Content dist/latest.yml -Raw
+          if ($metadata -notmatch 'sha512:\s*(\S+)') { throw 'Update metadata has no checksum' }
+          $expected = $Matches[1]
+          $bytes = [IO.File]::ReadAllBytes((Resolve-Path "dist/$installer"))
+          $actual = [Convert]::ToBase64String([Security.Cryptography.SHA512]::HashData($bytes))
+          if ($actual -ne $expected) { throw 'Installer does not match update metadata' }
+          gh release view $tag --json tagName
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --title "Artificial Inventor $version" --notes-file docs/RELEASE_NOTES.md
+            if ($LASTEXITCODE -ne 0) { throw 'Could not create release' }
+          }
+          $assets = Get-ChildItem dist/*.exe,dist/*.blockmap,dist/latest.yml | ForEach-Object { $_.FullName }
+          gh release upload $tag @assets --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Release asset upload failed' }
+          $published = gh release view $tag --json assets | ConvertFrom-Json
+          foreach ($name in @($installer, 'latest.yml')) {
+            $asset = @($published.assets | Where-Object { $_.name -eq $name -and $_.state -eq 'uploaded' })
+            if ($asset.Count -ne 1) { throw "Required asset was not published: $name" }
+          }
+          gh release edit $tag --latest --title "Artificial Inventor $version" --notes-file docs/RELEASE_NOTES.md
+          if ($LASTEXITCODE -ne 0) { throw 'Could not finalize the release' }
       - uses: actions/upload-artifact@v4
         if: always()
         with:
