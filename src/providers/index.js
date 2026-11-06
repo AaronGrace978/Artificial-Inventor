@@ -61,7 +61,8 @@ async function requestJSON(provider, path, key, { method = 'GET', body, signal, 
   const requestSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
   try {
     const response = await fetchImpl(url.href, {
-      method, headers: headersFor(provider, key), redirect: 'error', signal: requestSignal,
+      method, headers: { ...headersFor(provider, key), ...(method === 'GET' ? { 'Cache-Control': 'no-cache', Pragma: 'no-cache' } : {}) }, redirect: 'error', signal: requestSignal,
+      ...(method === 'GET' ? { cache: 'no-store' } : {}),
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     });
     if (!response.ok) {
@@ -128,6 +129,18 @@ function textCapability(item, provider) {
   return provider.kind === 'anthropic' ? 'provider-metadata' : 'unverified';
 }
 
+function catalogDate(item) {
+  // Preserve provider provenance, not an invented release date. In particular,
+  // Ollama's modified_at describes catalog changes, not model quality or age.
+  for (const [value, kind] of [[item.modified_at, 'modified'], [item.created_at, 'created'], [item.created, 'created']]) {
+    let timestamp;
+    if (typeof value === 'string' && value.length <= 64 && /^\d{4}-\d{2}-\d{2}T/.test(value)) timestamp = Date.parse(value);
+    else if (typeof value === 'number' && Number.isFinite(value) && value > 0) timestamp = value * 1000;
+    if (Number.isFinite(timestamp) && Number.isFinite(new Date(timestamp).getTime())) return { catalogDate: new Date(timestamp).toISOString(), catalogDateKind: kind };
+  }
+  return {};
+}
+
 /** Catalogs are availability data, not rankings or evidence of model quality. */
 export async function discoverModels(providerId, key, options = {}) {
   const provider = providerFor(providerId);
@@ -150,7 +163,7 @@ export async function discoverModels(providerId, key, options = {}) {
         : provider.kind === 'ollama' ? item.model || item.name : item.id;
       if (typeof id !== 'string' || !id.trim() || id.length > 300 || /[\r\n\0]/.test(id) || id.includes(apiKey)) continue;
       const redact = value => value.split(apiKey).join('[redacted]');
-      models.push({ id, name: redact(String(item.display_name || item.displayName || item.name || id)).slice(0, 300), capability: 'text-generation', capabilitySource, ...(typeof item.description === 'string' ? { description: redact(item.description).slice(0, 1000) } : {}) });
+      models.push({ id, name: redact(String(item.display_name || item.displayName || item.name || id)).slice(0, 300), capability: 'text-generation', capabilitySource, ...catalogDate(item), ...(typeof item.description === 'string' ? { description: redact(item.description).slice(0, 1000) } : {}) });
     }
     const previousPage = nextPage;
     nextPage = provider.kind === 'google' ? data.nextPageToken || ''
@@ -158,7 +171,8 @@ export async function discoverModels(providerId, key, options = {}) {
     if (!nextPage) break;
     if (nextPage === previousPage || page === 7) throw new ProviderError('Provider catalog pagination exceeded the safety limit; the catalog was not refreshed.', 'CATALOG_LIMIT');
   }
-  return [...new Map(models.map(model => [model.id, model])).values()].sort((a, b) => a.name.localeCompare(b.name));
+  return [...new Map(models.map(model => [model.id, model])).values()].sort((a, b) =>
+    (Date.parse(b.catalogDate) || 0) - (Date.parse(a.catalogDate) || 0) || a.name.localeCompare(b.name));
 }
 
 function modelIdFor(value, provider) {

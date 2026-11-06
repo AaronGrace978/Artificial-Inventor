@@ -8,6 +8,7 @@ let catalog = [];
 let toastTimer;
 let running = false;
 let currentRun;
+const catalogRequests = new Map();
 
 function node(tag, text, className) {
   const element = document.createElement(tag);
@@ -40,6 +41,7 @@ function showPage(page) {
   $('breadcrumb-page').textContent = names[page];
   window.scrollTo({ top: 0, behavior: 'instant' });
   if (page === 'evidence' && api) refreshEvidence().catch((error) => toast(message(error), true));
+  if (page === 'models' && api) refreshVisibleCatalog().catch((error) => toast(message(error), true));
 }
 function action(text, handler, className = 'button secondary') {
   const button = node('button', text, className);
@@ -258,7 +260,7 @@ function renderProviderStatus() {
   const entry = provider();
   $('provider-state').textContent = entry?.configured ? `${entry.name}: key available in the main process (${state.credentialStorage === 'session-only' ? 'this session only; OS encryption is unavailable' : 'OS-encrypted storage'}).` : 'No key saved for this provider.';
   $('remove-key').disabled = !entry?.configured;
-  $('refresh-models').disabled = !entry?.configured;
+  $('refresh-models').disabled = !entry?.configured || catalogRequests.has(entry?.id);
 }
 function renderSelection() {
   const selected = state.selectedModel;
@@ -276,6 +278,8 @@ function renderSelection() {
 }
 function renderCatalog() {
   const target = $('model-list');
+  const previousFilter = target.querySelector('input[type="search"]')?.value || '';
+  const previousOrder = target.querySelector('select')?.value || 'recent';
   target.replaceChildren();
   const providerId = $('provider-select').value;
   const cached = state.modelCatalogs?.[providerId];
@@ -286,18 +290,29 @@ function renderCatalog() {
   if (cached?.error) target.append(node('p', `Last refresh failed: ${cached.error}. The catalog below is cached.`, 'ledger-warnings'));
   const search = node('input', null, 'search-models');
   search.type = 'search'; search.placeholder = `Filter ${catalog.length} available models…`; search.setAttribute('aria-label', 'Filter available models');
+  search.value = previousFilter;
+  const order = node('select', null, 'search-models');
+  order.setAttribute('aria-label', 'Model catalog order');
+  for (const [value, label] of [['recent', 'Recently updated first'], ['name', 'Name A–Z']]) {
+    const option = node('option', label); option.value = value; order.append(option);
+  }
+  order.value = previousOrder;
   const list = node('div');
   const count = node('p', null, 'field-help');
-  target.append(search, count, list);
+  target.append(search, order, count, list);
   const draw = () => {
     list.replaceChildren();
     const filter = search.value.trim().toLowerCase();
-    const matches = catalog.filter((entry) => `${entry.id} ${entry.name || ''}`.toLowerCase().includes(filter));
+    const matches = catalog.filter((entry) => `${entry.id} ${entry.name || ''}`.toLowerCase().includes(filter)).sort((a, b) => {
+      const dateDifference = (Date.parse(b.catalogDate) || 0) - (Date.parse(a.catalogDate) || 0);
+      return order.value === 'recent' && dateDifference ? dateDifference : (a.name || a.id).localeCompare(b.name || b.id);
+    });
     count.textContent = `${matches.length} models${cached?.refreshedAt ? ` · refreshed ${date(cached.refreshedAt)}` : ''}${matches.length > 100 ? ' · showing first 100; filter to narrow' : ''}`;
     for (const model of matches.slice(0, 100)) {
       const row = node('div', null, 'model-row');
       const label = node('div'); label.append(node('strong', model.name || model.id));
       if (model.name && model.name !== model.id) label.append(node('small', model.id));
+      if (model.catalogDate) label.append(node('small', `${model.catalogDateKind === 'modified' ? 'Catalog updated' : 'Provider created'} ${date(model.catalogDate)}`));
       if (model.capabilitySource === 'unverified') label.append(node('small', 'Text-generation compatibility unverified'));
       const selected = state.selectedModel?.providerId === providerId && state.selectedModel?.model === model.id;
       const select = action(selected ? 'Selected ✓' : 'Select', async () => {
@@ -309,7 +324,42 @@ function renderCatalog() {
       row.append(label, select); list.append(row);
     }
   };
-  search.addEventListener('input', draw); draw();
+  search.addEventListener('input', draw); order.addEventListener('change', draw); draw();
+}
+function applyCatalogChange(value) {
+  if (!value || typeof value.providerId !== 'string') return;
+  state.modelCatalogs = { ...state.modelCatalogs, [value.providerId]: value.catalog };
+  if ($('provider-select').value === value.providerId) {
+    catalog = Array.isArray(value.catalog?.models) ? value.catalog.models : [];
+    renderCatalog(); renderProviderStatus();
+  }
+}
+async function refreshVisibleCatalog(force = false) {
+  const providerId = $('provider-select').value;
+  if (!state.providers.some(entry => entry.id === providerId && entry.configured)) return;
+  const cached = state.modelCatalogs?.[providerId];
+  const age = Date.now() - Date.parse(cached?.refreshedAt);
+  if (!force && !cached?.error && Number.isFinite(age) && age >= 0 && age < 60_000) return;
+  if (catalogRequests.has(providerId)) return catalogRequests.get(providerId);
+  const request = (async () => {
+    $('refresh-models').disabled = true;
+    $('provider-state').textContent = 'Fetching the live provider catalog…';
+    try {
+      await api.discoverModels(providerId);
+      // Read the persisted provider timestamp; the background-change event may
+      // already have updated this view while the request was in progress.
+      const next = await api.getState();
+      applyCatalogChange({ providerId, catalog: next.modelCatalogs[providerId] });
+    } catch (error) {
+      if ($('provider-select').value === providerId) $('provider-state').textContent = message(error);
+      throw error;
+    } finally {
+      catalogRequests.delete(providerId);
+      renderProviderStatus();
+    }
+  })();
+  catalogRequests.set(providerId, request);
+  return request;
 }
 function providerChanged() {
   $('provider-key').value = '';
@@ -353,7 +403,12 @@ function applyState(next) {
 document.querySelectorAll('[data-page]').forEach((button) => button.addEventListener('click', () => showPage(button.dataset.page)));
 document.querySelector('.brand').addEventListener('click', (event) => { event.preventDefault(); showPage('research'); });
 $('view-evidence').addEventListener('click', () => showPage('evidence'));
-$('provider-select').addEventListener('change', providerChanged);
+$('provider-select').addEventListener('change', () => {
+  // A filter for the previous provider should not hide a newly selected catalog.
+  $('model-list').replaceChildren();
+  providerChanged();
+  refreshVisibleCatalog().catch(error => toast(message(error), true));
+});
 $('research-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   if (running || !api) return;
@@ -395,7 +450,8 @@ $('provider-form').addEventListener('submit', async (event) => {
   try {
     await api.saveProviderKey({ providerId, key });
     applyState(await api.getState());
-    toast('Connection saved. Refresh the catalog to verify access.');
+    await refreshVisibleCatalog(true);
+    toast('Connection saved and provider catalog refreshed.');
   } catch (error) { toast(message(error), true); }
   finally { $('save-key').disabled = false; }
 });
@@ -405,16 +461,10 @@ $('remove-key').addEventListener('click', async () => {
   catch (error) { toast(message(error), true); }
 });
 $('refresh-models').addEventListener('click', async () => {
-  const providerId = $('provider-select').value;
-  $('refresh-models').disabled = true;
-  $('provider-state').textContent = 'Fetching the live provider catalog…';
   try {
-    const result = await api.discoverModels(providerId);
-    catalog = Array.isArray(result) ? result : result.models || [];
-    state.modelCatalogs = { ...state.modelCatalogs, [providerId]: { models: catalog, refreshedAt: new Date().toISOString() } };
-    renderCatalog(); renderProviderStatus(); toast(`Discovered ${catalog.length} models.`);
+    await refreshVisibleCatalog(true);
+    toast(`Discovered ${catalog.length} models.`);
   } catch (error) { $('provider-state').textContent = message(error); toast(message(error), true); }
-  finally { $('refresh-models').disabled = false; }
 });
 $('export-all').addEventListener('click', () => exportEvidence().catch((error) => toast(message(error), true)));
 $('refresh-evidence').addEventListener('click', () => refreshEvidence().catch((error) => toast(message(error), true)));
@@ -440,6 +490,7 @@ async function initialize() {
   }
   try {
     if (typeof api.onUpdate === 'function') api.onUpdate(renderUpdates);
+    if (typeof api.onCatalogChange === 'function') api.onCatalogChange(applyCatalogChange);
     applyState(await api.getState());
     await refreshEvidence();
   } catch (error) { toast(`Could not initialize workspace: ${message(error)}`, true); }

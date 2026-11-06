@@ -60,6 +60,49 @@ test('Ollama Cloud uses its cloud tags endpoint, not a local service', async () 
   assert.equal(models[0].id, 'newest-cloud-model');
 });
 
+test('catalog refreshes bypass HTTP caches and surface recent provider dates without release claims', async () => {
+  const models = await discoverModels('ollama', 'ollama-key', { fetchImpl: async (_url, options) => {
+    assert.equal(options.cache, 'no-store');
+    assert.equal(options.headers['Cache-Control'], 'no-cache');
+    return json({ models: [
+      { model: 'a-older-model', modified_at: '2025-01-01T00:00:00Z' },
+      { model: 'z-newly-advertised-model:pro', modified_at: '2026-11-06T12:34:56.123456789Z' },
+      { model: 'b-no-provider-date' },
+      { model: 'c-invalid-date', modified_at: 'not-a-date', created_at: '2026-01-02T00:00:00Z' },
+    ] });
+  } });
+  assert.deepEqual(models.map(model => model.id), ['z-newly-advertised-model:pro', 'c-invalid-date', 'a-older-model', 'b-no-provider-date']);
+  assert.equal(models[0].catalogDate, '2026-11-06T12:34:56.123Z');
+  assert.equal(models[0].catalogDateKind, 'modified');
+  assert.equal(models[1].catalogDateKind, 'created');
+  assert.equal(models[3].catalogDate, undefined);
+  assert(!models.some(model => Object.hasOwn(model, 'releaseDate')));
+  const openai = await discoverModels('openai', 'openai-key', { fetchImpl: async () => json({ data: [
+    { id: 'undated', created: 1e100 }, { id: 'timestamped', created: 1735689600 },
+  ] }) });
+  assert.equal(openai[0].catalogDate, '2025-01-01T00:00:00.000Z');
+  assert.equal(openai[0].catalogDateKind, 'created');
+  assert.equal(openai[1].catalogDate, undefined);
+});
+
+test('a newly advertised Ollama identifier passes unchanged from discovery to generation', async () => {
+  // Deliberately synthetic: this checks future IDs, not a claim of a live model.
+  const futureId = 'future-family-3.1:pro';
+  const models = await discoverModels('ollama', 'ollama-key', { fetchImpl: async () => json({ models: [{ model: futureId }] }) });
+  const result = await generateProposals({ providerId: 'ollama', model: models[0].id, key: 'ollama-key', spec: { budget: 20 } }, {
+    fetchImpl: async (url, options) => {
+      assert.equal(url, 'https://ollama.com/api/chat');
+      const body = JSON.parse(options.body);
+      assert.equal(body.model, futureId);
+      assert.equal(body.stream, false);
+      return json({ done: true, message: { thinking: 'Untrusted reasoning is not design JSON.', content: JSON.stringify({ proposals: [valid] }) } });
+    }
+  });
+  assert.equal(result.model, futureId);
+  assert.deepEqual(result.proposals, [valid]);
+  assert(!result.rawText.includes('Untrusted reasoning'));
+});
+
 test('model catalogs fail closed for malformed data and nonadvancing pagination', async () => {
   await assert.rejects(discoverModels('openai', 'key', { fetchImpl: async () => json({ model: 'wrong' }) }), { code: 'INVALID_CATALOG' });
   await assert.rejects(discoverModels('google', 'key', { fetchImpl: async () => json({ models: [], nextPageToken: 'same' }) }), { code: 'CATALOG_LIMIT' });

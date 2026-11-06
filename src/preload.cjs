@@ -14,6 +14,11 @@ contextBridge.exposeInMainWorld('inventor', Object.freeze({
   selectModel: selection => invoke('inventor:select-model', selection),
   checkUpdates: () => invoke('inventor:updates'),
   installUpdate: () => invoke('inventor:install-update'),
+  onCatalogChange: callback => {
+    const listener = (_event, value) => callback(value);
+    ipcRenderer.on('inventor:catalog-state', listener);
+    return () => ipcRenderer.removeListener('inventor:catalog-state', listener);
+  },
   onUpdate: callback => {
     const listener = (_event, state) => callback(state);
     ipcRenderer.on('inventor:update-state', listener);

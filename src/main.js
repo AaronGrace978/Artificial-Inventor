@@ -9,14 +9,13 @@ import { EvidenceLedger } from './core/ledger.js';
 import { DEFAULT_SPEC, validateSpec } from './core/research.js';
 import { listProviders, discoverModels, generateProposals } from './providers/index.js';
 import { runComputation } from './runner.js';
+import { CatalogService, CATALOG_REFRESH_MS } from './catalogs.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const rendererURL = pathToFileURL(path.join(here, 'renderer/index.html')).href;
-const CATALOG_TTL = 6 * 60 * 60 * 1000;
-let mainWindow, store, ledger, updates, providerSession;
+const APP_UPDATE_INTERVAL = 6 * 60 * 60 * 1000;
+let mainWindow, store, ledger, updates, providerSession, catalogs;
 let running = false;
-const refreshes = new Map();
-const credentialEpochs = new Map();
 const providers = listProviders();
 // Test-only data isolation is unavailable in distributed applications.
 if (!app.isPackaged && process.env.ARTIFICIAL_INVENTOR_DATA_DIR) {
@@ -64,32 +63,6 @@ async function evidenceState() {
     events: records.map(record => ({ type: record.type, timestamp: record.timestamp, hash: record.hash, ...(record.payload.message ? { message: record.payload.message } : {}), ...(record.payload.run?.id ? { runId: record.payload.run.id } : {}) })).reverse()
   };
 }
-async function refreshCatalog(id) {
-  provider(id);
-  if (refreshes.has(id)) return refreshes.get(id);
-  const epoch = credentialEpochs.get(id) ?? 0;
-  const refresh = (async () => {
-    const key = store.getKey(id);
-    if (!key) throw new Error('Connect this provider with your API key first.');
-    try {
-      const models = await discoverModels(id, key, { fetchImpl: (url, options) => providerSession.fetch(url, options) });
-      if (epoch !== (credentialEpochs.get(id) ?? 0)) throw new Error('The provider connection changed. Refresh its catalog again.');
-      store.data.catalogs[id] = { models, refreshedAt: new Date().toISOString(), error: null };
-      await store.persist();
-      return models;
-    } catch (error) {
-      if (epoch !== (credentialEpochs.get(id) ?? 0)) throw error;
-      store.data.catalogs[id] = { ...(store.data.catalogs[id] ?? { models: [] }), error: error.message };
-      await store.persist();
-      throw error;
-    }
-  })();
-  refreshes.set(id, refresh);
-  try { return await refresh; } finally { if (refreshes.get(id) === refresh) refreshes.delete(id); }
-}
-async function refreshConfigured() {
-  await Promise.allSettled(providers.filter(item => store.configured(item.id)).map(item => refreshCatalog(item.id)));
-}
 async function start() {
   store = new SettingsStore(app.getPath('userData'), safeStorage);
   await store.load();
@@ -100,6 +73,8 @@ async function start() {
   // setting also supports the managed cloud's inherited HTTP proxy.
   const proxyURL = process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
   if (proxyURL) await providerSession.setProxy({ proxyRules: proxyURL });
+  catalogs = new CatalogService({ providers, store, discover: (id, key) => discoverModels(id, key, { fetchImpl: (url, options) => providerSession.fetch(url, options) }) });
+  catalogs.on('change', value => mainWindow?.webContents.send('inventor:catalog-state', value));
   updates = new UpdateManager(updaterPackage.autoUpdater, app.isPackaged && process.platform === 'win32');
   updates.on('change', value => mainWindow?.webContents.send('inventor:update-state', value));
   // No browser-origin requests are necessary. All provider calls use fixed main-process adapters.
@@ -115,6 +90,7 @@ async function start() {
       runs: evidence.runs.slice(0, 50), ledgerIntegrity: evidence.integrity, evidenceEvents: evidence.events,
       update: updates.state, running,
       credentialStorage: store.canEncrypt() ? 'os-encrypted' : 'session-only',
+      catalogRefreshMinutes: CATALOG_REFRESH_MS / 60_000,
     };
   });
   register('evidence', evidenceState);
@@ -122,20 +98,17 @@ async function start() {
     if (!input || typeof input !== 'object') throw new Error('Provider details are required.');
     const id = provider(input.providerId);
     const result = await store.saveKey(id, input.key);
-    credentialEpochs.set(id, (credentialEpochs.get(id) ?? 0) + 1);
-    refreshes.delete(id);
-    delete store.data.catalogs[id];
+    catalogs.invalidate(id);
     if (store.data.selectedModel?.providerId === id) store.data.selectedModel = null;
     await store.persist();
     return result;
   });
   register('remove-key', async id => {
     provider(id);
-    credentialEpochs.set(id, (credentialEpochs.get(id) ?? 0) + 1);
-    refreshes.delete(id);
+    catalogs.invalidate(id);
     return store.removeKey(id);
   });
-  register('models', refreshCatalog);
+  register('models', id => catalogs.refresh(provider(id)));
   register('select-model', async selection => {
     if (selection === null) { store.data.selectedModel = null; await store.persist(); return null; }
     if (!selection || typeof selection !== 'object') throw new Error('Select a provider and a model.');
@@ -160,8 +133,7 @@ async function start() {
       if (useCloud) {
         const selection = store.data.selectedModel;
         if (!selection) throw new Error('Connect and select a cloud model first, or run the offline search.');
-        const catalog = store.data.catalogs[selection.providerId];
-        if (!catalog || catalog.error || Date.now() - Date.parse(catalog.refreshedAt) > CATALOG_TTL) await refreshCatalog(selection.providerId);
+        if (!catalogs.fresh(selection.providerId)) await catalogs.refresh(selection.providerId);
         if (!store.data.catalogs[selection.providerId].models.some(item => item.id === selection.model)) throw new Error('The selected model is no longer listed. Choose another model explicitly.');
         generation = await generateProposals({ ...selection, key: store.getKey(selection.providerId), spec }, { fetchImpl: (url, options) => providerSession.fetch(url, options) });
         await ledger.append('proposal.received', generation);
@@ -191,9 +163,10 @@ async function start() {
   register('install-update', () => updates.install());
   createWindow();
   // Catalog refresh discovers new IDs without silently changing a qualified model.
-  void refreshConfigured();
+  void catalogs.refreshConfigured();
   void updates.check();
-  setInterval(() => { void refreshConfigured(); void updates.check(); }, CATALOG_TTL).unref();
+  setInterval(() => { void catalogs.refreshConfigured(); }, CATALOG_REFRESH_MS).unref();
+  setInterval(() => { void updates.check(); }, APP_UPDATE_INTERVAL).unref();
 }
 function createWindow() {
   mainWindow = new BrowserWindow({
