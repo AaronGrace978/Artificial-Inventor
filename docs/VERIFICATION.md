@@ -35,7 +35,7 @@ A candidate can have E2 computational evidence and still be rejected for exceedi
 | Technical determination of human values | Humans supply goals, constraints, budgets, and decisions | Optimization cannot establish moral authority, representation, consent, or legitimate trade-offs. |
 | Safe unlimited recursive improvement | Improvements remain proposed offline studies requiring external evaluation and authorization | There is no self-rewriting or automatic research-system deployment, and no claim of safe unlimited improvement. |
 
-The application never fabricates, controls instruments, launches model-generated code, or grants a model filesystem or shell access. Numerical evaluation runs in a worker thread with memory and wall-clock limits. A worker thread is a responsiveness/resource control for trusted numerical code, not an isolation boundary suitable for executing hostile code.
+The application never fabricates, controls instruments, grants a model filesystem or shell access, or runs generated source with native privileges. Build studio can execute browser JavaScript only after an operator starts an isolated preview; generated source is not executed by the numerical or parser workers. Numerical evaluation runs in a worker thread with memory and wall-clock limits. A worker thread is a responsiveness/resource control for trusted numerical code, not an isolation boundary suitable for executing hostile code.
 
 ## Evidence integrity and external anchoring
 
@@ -48,3 +48,9 @@ For stronger provenance, export the complete evidence package and record the led
 ## Before making a physical claim
 
 Preregister a candidate, predictions, uncertainty, operating envelope, stopping criteria, and analysis procedure before measurement. Use calibrated equipment, baseline controls, retained failed trials, and explicit tolerances. Record mismatch without silently changing the prediction. Have separate operators and equipment replicate important results. The current application exports the computational package and a suggested plan; these physical steps remain outside its implemented workflow.
+
+## Build studio validation
+
+Projects are limited to 30 files, 100 KiB per file and 500 KiB total, with validated portable paths and no overwrite export. A fixed worker statically parses JavaScript/ESM and JSON and checks common local-resource references. HTML/CSS are not fully validated against browser standards, and syntax success does not establish functional correctness. Other source languages are exported without claiming compilation or execution. Browser previews are operator-started, receive no bridge or secrets, and have an opaque origin plus a restrictive response CSP; source runs in Chromium, not QuickJS or a native process. The integration suite exercises selected real interactions in two example projects, not arbitrary generated program correctness.
+
+Interrupted build tasks retain their brief, project type and time limit. Retrying creates a new generation attempt. There is no exact provider token-state recovery, local embedding fallback, TPM/HSM signing, lesson notebook, cross-model critique engine, or calibrated statistical acceptance rule in this release. Hardware anchoring and model-based review would require separate threat models and qualification.

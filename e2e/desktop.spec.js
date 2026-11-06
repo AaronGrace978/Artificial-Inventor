@@ -26,6 +26,7 @@ test('real Electron app computes, preserves evidence, restricts IPC, and protect
     expect(initial.providers.some(provider => provider.id === 'ollama')).toBe(true);
     expect(initial.selectedModel).toBeNull();
     await expect(window.locator('#app-version')).toHaveText(initial.version);
+    await window.locator('[data-page="research"]').click();
 
     // Exercise the actual renderer -> preload -> IPC -> worker -> ledger path.
     await window.locator('input[name="budget"]').fill('20');

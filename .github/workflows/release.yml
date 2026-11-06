@@ -64,11 +64,37 @@ jobs:
           $assets = Get-ChildItem dist/*.exe,dist/*.blockmap,dist/latest.yml | ForEach-Object { $_.FullName }
           gh release upload $tag @assets --clobber
           if ($LASTEXITCODE -ne 0) { throw 'Release asset upload failed' }
-          $published = gh release view $tag --json assets | ConvertFrom-Json
-          foreach ($name in @($installer, 'latest.yml')) {
-            $asset = @($published.assets | Where-Object { $_.name -eq $name -and $_.state -eq 'uploaded' })
-            if ($asset.Count -ne 1) { throw "Required asset was not published: $name" }
+          $ready = $false
+          for ($attempt = 0; $attempt -lt 6; $attempt++) {
+            $publishedJson = gh release view $tag --json assets
+            if ($LASTEXITCODE -eq 0) {
+              $published = $publishedJson | ConvertFrom-Json
+              $ready = $true
+              foreach ($name in @($installer, 'latest.yml')) {
+                $expectedSize = (Get-Item "dist/$name").Length
+                $asset = @($published.assets | Where-Object { $_.name -eq $name -and $_.state -eq 'uploaded' -and $_.size -eq $expectedSize })
+                if ($asset.Count -ne 1) { $ready = $false }
+              }
+              if ($ready) { break }
+              $published.assets | Select-Object name,state,size | ConvertTo-Json
+            }
+            Start-Sleep -Seconds 5
           }
+          if (!$ready) { Write-Host 'Asset-list metadata is not current; checking downloadable bytes directly.' }
+          $downloaded = $false
+          $verifyDirectory = Join-Path $env:RUNNER_TEMP ([Guid]::NewGuid().ToString())
+          for ($attempt = 0; $attempt -lt 12; $attempt++) {
+            gh release download $tag --pattern $installer --pattern latest.yml --dir $verifyDirectory --skip-existing
+            if ($LASTEXITCODE -eq 0) { $downloaded = $true; break }
+            Start-Sleep -Seconds 5
+          }
+          if (!$downloaded) { throw 'Published assets could not be downloaded after bounded retries' }
+          $remoteMetadata = Get-Content (Join-Path $verifyDirectory 'latest.yml') -Raw
+          if ($remoteMetadata -notmatch 'sha512:\s*(\S+)') { throw 'Published metadata has no checksum' }
+          $remoteExpected = $Matches[1]
+          $remoteBytes = [IO.File]::ReadAllBytes((Join-Path $verifyDirectory $installer))
+          $remoteActual = [Convert]::ToBase64String([Security.Cryptography.SHA512]::HashData($remoteBytes))
+          if ($remoteActual -ne $remoteExpected -or $remoteActual -ne $expected) { throw 'Published installer checksum mismatch' }
           gh release edit $tag --latest --title "Artificial Inventor $version" --notes-file docs/RELEASE_NOTES.md
           if ($LASTEXITCODE -ne 0) { throw 'Could not finalize the release' }
       - uses: actions/upload-artifact@v4

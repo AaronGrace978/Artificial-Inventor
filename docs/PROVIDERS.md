@@ -22,6 +22,14 @@ Known embedding, speech, image, moderation, and other non-text models are filter
 
 Generation requests ask for bounded heat-sink dimensions and never grant tool access. Model text is parsed as data. Only numeric design dimensions and a short rationale reach the independent research checks; model-supplied code, verification status, permissions, and scores are discarded. Refused, malformed, oversized, timed-out, and explicitly incomplete responses fail closed. Provider errors omit response bodies and native error details to avoid echoing credentials.
 
+## Generation progress, cancellation, and project files
+
+Heat-sink proposal requests now allow five minutes; project generation allows ten minutes. Catalog requests retain a one-minute limit. These are total request deadlines covering connection, reasoning, and streamed output—not inactivity timers reset by incoming chunks. The operator can cancel a request. Cancellation closes the local request but cannot guarantee that a provider stops remote work or billing immediately. Generation is never automatically retried against a paid API.
+
+Ollama Cloud generation uses streaming NDJSON. OpenAI Responses, Anthropic Messages, Gemini `streamGenerateContent`, and compatible chat providers use their SSE streams. Progress exposes elapsed time and whether the provider is waiting, reasoning, or sending final output. Hidden reasoning is not displayed, persisted as project output, or treated as evidence. Servers returning a complete ordinary JSON response remain supported. A stream must deliver its completion marker; valid-looking partial JSON and output-limit truncation are rejected.
+
+Project generation asks for complete source artifacts with at most 30 files, 100 KiB per file, and 500 KiB total, using an output-token allowance of 12,000. It supports self-contained browser apps, source-code projects, and invention briefs. Generation does not execute programs, install dependencies, run generated tests, or establish that generated software works. The build workspace separately validates file paths, supported syntax, and its preview boundary. Browser projects are requested without external scripts, CDN assets, server dependencies, or module imports so they can be inspected in an isolated local preview.
+
 ## Network access and validation
 
 Restricted cloud environments need these HTTPS hosts allowed for the connections you use:

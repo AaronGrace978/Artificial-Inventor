@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { listProviders, discoverModels, generateProposals, parseProposals } from '../src/providers/index.js';
+import { listProviders, discoverModels, generateProposals, parseProposals, generateProject, parseProject, PROPOSAL_TIMEOUT_MS, PROJECT_TIMEOUT_MS } from '../src/providers/index.js';
 
 const valid = { finCount: 12, finHeightMm: 30, finThicknessMm: 1.2, baseThicknessMm: 3, rationale: 'A hypothesis, not a measured result.' };
 const json = data => new Response(JSON.stringify(data), { status: 200, headers: { 'Content-Type': 'application/json' } });
@@ -94,7 +94,7 @@ test('a newly advertised Ollama identifier passes unchanged from discovery to ge
       assert.equal(url, 'https://ollama.com/api/chat');
       const body = JSON.parse(options.body);
       assert.equal(body.model, futureId);
-      assert.equal(body.stream, false);
+      assert.equal(body.stream, true);
       return json({ done: true, message: { thinking: 'Untrusted reasoning is not design JSON.', content: JSON.stringify({ proposals: [valid] }) } });
     }
   });
@@ -193,7 +193,7 @@ test('proposal requests use each vendor API and return hypotheses rather than ev
 });
 
 test('refusal or truncated output is not promoted to a valid proposal', async () => {
-  await assert.rejects(generateProposals({ providerId: 'openai', model: 'test-model', key: 'key', spec: {} }, { fetchImpl: async () => json({ output: [{ content: [{ type: 'refusal', refusal: 'Cannot answer' }] }] }) }), { code: 'INVALID_PROPOSALS' });
+  await assert.rejects(generateProposals({ providerId: 'openai', model: 'test-model', key: 'key', spec: {} }, { fetchImpl: async () => json({ output: [{ content: [{ type: 'refusal', refusal: 'Cannot answer' }] }] }) }), { code: 'REFUSED' });
   await assert.rejects(generateProposals({ providerId: 'google', model: '../../attack', key: 'key', spec: {} }), { code: 'INVALID_MODEL' });
   await assert.rejects(generateProposals({ providerId: 'openai', model: 'test-model', key: 'key', spec: {} }, { fetchImpl: async () => json({ status: 'incomplete', output_text: JSON.stringify({ proposals: [valid] }) }) }), { code: 'INCOMPLETE_RESPONSE' });
   await assert.rejects(generateProposals({ providerId: 'anthropic', model: 'test-model', key: 'key', spec: {} }, { fetchImpl: async () => json({ content: 'wrong-shape' }) }), { code: 'INVALID_PROPOSALS' });
@@ -222,4 +222,156 @@ test('model candidates and Ollama token generation respect explicit resource cap
     assert(body.messages[1].content.includes('at most 1'));
     return json({ message: { content: JSON.stringify({ proposals: [valid, valid] }) } });
   } }), { code: 'PROPOSAL_BUDGET' });
+});
+
+function streamingResponse(frames, type = 'application/x-ndjson') {
+  const bytes = new TextEncoder().encode(frames.join(type === 'text/event-stream' ? '\n\n' : '\n') + '\n\n');
+  return new Response(new ReadableStream({ start(controller) {
+    // Split inside JSON strings, delimiters and multibyte UTF-8 sequences.
+    for (let i = 0; i < bytes.length; i += 13) controller.enqueue(bytes.slice(i, i + 13));
+    controller.close();
+  } }), { headers: { 'content-type': type } });
+}
+
+test('reasoning requests have explicit longer deadlines and receive only sanitized progress', async () => {
+  assert.equal(PROPOSAL_TIMEOUT_MS, 300_000);
+  assert.equal(PROJECT_TIMEOUT_MS, 600_000);
+  const progress = [];
+  const secret = 'sensitive-private-provider-key';
+  const raw = JSON.stringify({ proposals: [{ ...valid, rationale: 'A naïve prototype ☀' }] });
+  const result = await generateProposals({ providerId: 'ollama', model: 'reasoning-model', key: secret, spec: {}, onProgress: event => progress.push(event) }, {
+    fetchImpl: async (_url, options) => {
+      assert.equal(JSON.parse(options.body).stream, true);
+      return streamingResponse([
+        JSON.stringify({ message: { thinking: `Untrusted reasoning ${secret}` }, done: false }),
+        JSON.stringify({ message: { content: raw.slice(0, 51) }, done: false }),
+        JSON.stringify({ message: { content: raw.slice(51) }, done: false }),
+        JSON.stringify({ done: true, done_reason: 'stop' }),
+      ]);
+    }
+  });
+  assert.equal(result.proposals[0].rationale, 'A naïve prototype ☀');
+  assert(progress.some(event => event.status === 'thinking'));
+  assert(progress.some(event => event.status === 'generating'));
+  assert(progress.every(event => event.deadlineMs === 300_000));
+  assert(!JSON.stringify(progress).includes(secret));
+  assert(!JSON.stringify(progress).includes('Untrusted reasoning'));
+  assert(!JSON.stringify(result).includes('Untrusted reasoning'));
+});
+
+test('all provider stream formats reconstruct final text without accepting hidden reasoning', async () => {
+  const raw = JSON.stringify({ proposals: [valid] });
+  for (const provider of listProviders()) {
+    let frames, type = 'text/event-stream';
+    if (provider.id === 'ollama') { type = 'application/x-ndjson'; frames = [JSON.stringify({ message: { thinking: 'not a result', content: raw }, done: true })]; }
+    else if (provider.id === 'openai') frames = [`data: ${JSON.stringify({ type: 'response.reasoning_summary_text.delta', delta: 'not a result' })}`, `data: ${JSON.stringify({ type: 'response.output_text.delta', delta: raw })}`, `data: ${JSON.stringify({ type: 'response.completed' })}`];
+    else if (provider.id === 'anthropic') frames = [`event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', delta: { type: 'thinking_delta', thinking: 'not a result' } })}`, `data: ${JSON.stringify({ type: 'content_block_delta', delta: { type: 'text_delta', text: raw } })}`, 'data: {"type":"message_stop"}'];
+    else if (provider.id === 'google') frames = [`data: ${JSON.stringify({ candidates: [{ content: { parts: [{ thought: true, text: 'not a result' }, { text: raw }] }, finishReason: 'STOP' }] })}`];
+    else frames = [`data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: 'not a result', content: raw }, finish_reason: null }] })}`, 'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}', 'data: [DONE]'];
+    const result = await generateProposals({ providerId: provider.id, model: 'stream-model', key: 'test-key', spec: {} }, { fetchImpl: async () => streamingResponse(frames, type) });
+    assert.deepEqual(result.proposals, [valid], provider.id);
+    assert(!result.rawText.includes('not a result'), provider.id);
+  }
+});
+
+test('valid-looking partial JSON is rejected if the stream never completes or hits an output limit', async () => {
+  const raw = JSON.stringify({ proposals: [valid] });
+  for (const frames of [
+    [JSON.stringify({ message: { content: raw }, done: false })],
+    [JSON.stringify({ message: { content: raw }, done: true, done_reason: 'length' })],
+  ]) {
+    await assert.rejects(generateProposals({ providerId: 'ollama', model: 'model', key: 'test-key', spec: {} }, { fetchImpl: async () => streamingResponse(frames) }), { code: 'INCOMPLETE_RESPONSE' });
+  }
+  await assert.rejects(generateProposals({ providerId: 'ollama', model: 'model', key: 'test-key', spec: {} }, { fetchImpl: async () => streamingResponse(['{"error":"secret-key in error body"}']) }), error => error.code === 'STREAM_ERROR' && !error.message.includes('secret-key'));
+});
+
+test('provider filtering and refusals reject even valid-looking complete JSON, without retrying', async () => {
+  const raw = JSON.stringify({ proposals: [valid] });
+  const cases = [
+    ['groq', [`data: ${JSON.stringify({ choices: [{ delta: { content: raw }, finish_reason: 'content_filter' }] })}`, 'data: [DONE]']],
+    ['google', [`data: ${JSON.stringify({ candidates: [{ content: { parts: [{ text: raw }] }, finishReason: 'SAFETY' }] })}`]],
+    ['google', [`data: ${JSON.stringify({ candidates: [{ content: { parts: [{ text: raw }] }, finishReason: 'RECITATION' }] })}`]],
+    ['anthropic', [`data: ${JSON.stringify({ type: 'content_block_delta', delta: { type: 'text_delta', text: raw } })}`, 'data: {"type":"message_delta","delta":{"stop_reason":"refusal"}}', 'data: {"type":"message_stop"}']],
+    ['openai', [`data: ${JSON.stringify({ type: 'response.output_text.delta', delta: raw })}`, 'data: {"type":"response.refusal.done","refusal":"provider declined"}', 'data: {"type":"response.completed"}']],
+  ];
+  for (const [providerId, frames] of cases) {
+    let calls = 0;
+    await assert.rejects(generateProposals({ providerId, model: 'test-model', key: 'test-token', spec: {} }, { fetchImpl: async () => {
+      calls++;
+      return streamingResponse(frames, 'text/event-stream');
+    } }), error => error.code === 'REFUSED' && !error.message.includes('another model'));
+    assert.equal(calls, 1, 'A filtered paid request must not be retried automatically');
+  }
+  for (const [providerId, data] of [
+    ['google', { candidates: [{ content: { parts: [{ text: raw }] }, finishReason: 'PROHIBITED_CONTENT' }] }],
+    ['anthropic', { content: [{ type: 'text', text: raw }], stop_reason: 'refusal' }],
+    ['groq', { choices: [{ message: { content: raw }, finish_reason: 'content_filter' }] }],
+  ]) {
+    await assert.rejects(generateProposals({ providerId, model: 'test-model', key: 'test-token', spec: {} }, { fetchImpl: async () => json(data) }), { code: 'REFUSED' });
+  }
+});
+
+test('a stalled body is covered by the total deadline even when fetch ignores cancellation', async () => {
+  let canceled = false;
+  const keepAlive = setInterval(() => {}, 1000);
+  try {
+    await assert.rejects(generateProposals({ providerId: 'ollama', model: 'slow-model', key: 'test-key', spec: {} }, {
+      timeoutMs: 10,
+      fetchImpl: async () => new Response(new ReadableStream({ cancel() { canceled = true; } }), { headers: { 'content-type': 'application/x-ndjson' } })
+    }), error => error.code === 'TIMEOUT' && error.message.includes('Ollama Cloud') && error.message.includes('No partial result'));
+    assert.equal(canceled, true);
+  } finally { clearInterval(keepAlive); }
+});
+
+test('active reasoning chunks do not reset the total request deadline', async () => {
+  let interval;
+  const keepAlive = setInterval(() => {}, 1000);
+  try {
+    await assert.rejects(generateProposals({ providerId: 'ollama', model: 'slow-model', key: 'test-key', spec: {} }, {
+      timeoutMs: 25,
+      fetchImpl: async () => new Response(new ReadableStream({
+        start(controller) { interval = setInterval(() => controller.enqueue(new TextEncoder().encode('{"message":{"thinking":"ongoing"},"done":false}\n')), 3); },
+        cancel() { clearInterval(interval); }
+      }), { headers: { 'content-type': 'application/x-ndjson' } })
+    }), { code: 'TIMEOUT' });
+  } finally { clearInterval(interval); clearInterval(keepAlive); }
+});
+
+test('operator cancellation interrupts a stalled reasoning stream distinctly from timeout', async () => {
+  const controller = new AbortController();
+  const stop = setTimeout(() => controller.abort(), 5);
+  try {
+    await assert.rejects(generateProposals({ providerId: 'ollama', model: 'model', key: 'test-key', spec: {}, signal: controller.signal }, {
+      fetchImpl: async () => new Response(new ReadableStream({}), { headers: { 'content-type': 'application/x-ndjson' } })
+    }), { code: 'CANCELLED' });
+  } finally { clearTimeout(stop); }
+});
+
+test('project generation returns actual bounded files rather than executable authority', async () => {
+  const project = { title: 'Tiny counter', summary: 'A browser counter', files: [{ path: 'index.html', content: '<button id="count">0</button><script>let n=0;count.onclick=()=>count.textContent=++n;</script>' }, { path: 'README.md', content: 'Open index.html. Not independently validated.' }], instructions: 'Open index.html', execute: 'ignore this' };
+  const progress = [];
+  const result = await generateProject({ providerId: 'ollama', model: 'reasoning-pro', key: 'private-test-token', objective: 'Build a counter', kind: 'web-app', onProgress: event => progress.push(event) }, {
+    fetchImpl: async (_url, options) => {
+      const body = JSON.parse(options.body);
+      assert.equal(body.options.num_predict, 12000);
+      assert(body.messages[1].content.includes('Build a counter'));
+      assert.equal(body.stream, true);
+      return streamingResponse([JSON.stringify({ message: { content: JSON.stringify(project) }, done: true })]);
+    }
+  });
+  assert.deepEqual(result.project.files, project.files);
+  assert.equal(result.project.execute, undefined);
+  assert.equal(result.model, 'reasoning-pro');
+  assert.equal(progress[0].deadlineMs, 600_000);
+  assert.equal(result.kind, 'unverified-code-project');
+  for (const value of [null, { ...project, files: [] }, { ...project, files: [{ path: 'x.js', content: 2 }] }, { ...project, files: [{ path: 'x.js', content: 'x'.repeat(102401) }] }]) assert.throws(() => parseProject(JSON.stringify(value)), { code: 'INVALID_PROJECT' });
+  await assert.rejects(generateProject({ providerId: 'ollama', model: 'model', key: 'test-key', objective: '   ' }), { code: 'INVALID_OBJECTIVE' });
+});
+
+test('project artifacts redact an echoed provider key from every returned text field', async () => {
+  const secret = 'private-test-authentication-token';
+  const project = { title: `App ${secret}`, summary: secret, files: [{ path: 'index.html', content: secret }], instructions: secret };
+  const result = await generateProject({ providerId: 'openai', model: 'model', key: secret, objective: 'Build an app' }, { fetchImpl: async () => json({ output_text: JSON.stringify(project) }) });
+  assert(!JSON.stringify(result).includes(secret));
+  assert(result.project.files[0].content.includes('[redacted]'));
 });

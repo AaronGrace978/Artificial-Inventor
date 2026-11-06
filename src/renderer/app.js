@@ -1,6 +1,8 @@
+import { initializeBuildStudio, updateBuildSelection } from './build-studio.js';
+
 const api = window.inventor;
 const $ = (id) => document.getElementById(id);
-const names = { research: 'Research lab', evidence: 'Evidence ledger', models: 'Model connections', governance: 'Controls & limits', settings: 'App & updates' };
+const names = { build: 'Build studio', research: 'Research lab', evidence: 'Evidence ledger', models: 'Model connections', governance: 'Controls & limits', settings: 'App & updates' };
 let state = { providers: [], runs: [], selectedModel: null, modelCatalogs: {}, update: {} };
 let runs = [];
 let evidenceEvents = [];
@@ -9,6 +11,7 @@ let toastTimer;
 let running = false;
 let currentRun;
 const catalogRequests = new Map();
+let researchStarted = 0, researchTimer, researchUsesCloud = false;
 
 function node(tag, text, className) {
   const element = document.createElement(tag);
@@ -23,6 +26,18 @@ function date(value) {
   return Number.isNaN(parsed.getTime()) ? 'Unknown date' : parsed.toLocaleString(undefined, { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' });
 }
 function message(error) { return error instanceof Error ? error.message : String(error || 'An unexpected error occurred.'); }
+function updateResearchElapsed() {
+  const seconds = Math.max(0, Math.floor((Date.now() - researchStarted) / 1000));
+  $('research-elapsed').textContent = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}${researchUsesCloud ? ' / 5:00' : ''}`;
+}
+function renderResearchProgress(progress = {}) {
+  const titles = { waiting: 'Waiting for the model', thinking: 'Model is reasoning', generating: 'Generating designs', receiving: 'Receiving model output', validating: 'Checking candidates', complete: 'Response received', cancelled: 'Request cancelled', error: 'Request failed' };
+  $('research-progress').hidden = false;
+  $('research-progress').classList.toggle('error', progress.status === 'error');
+  $('research-progress-stage').textContent = titles[progress.status] || 'Computing & checking';
+  $('research-progress-detail').textContent = progress.message || (progress.receivedChars ? `${Number(progress.receivedChars).toLocaleString()} characters received. Waiting for the complete candidate data.` : 'The model has not returned complete candidate data yet.');
+  updateResearchElapsed();
+}
 function toast(text, error = false) {
   clearTimeout(toastTimer);
   $('toast').textContent = text;
@@ -263,6 +278,7 @@ function renderProviderStatus() {
   $('refresh-models').disabled = !entry?.configured || catalogRequests.has(entry?.id);
 }
 function renderSelection() {
+  updateBuildSelection(state);
   const selected = state.selectedModel;
   const target = $('active-model');
   target.replaceChildren(node('div', '◇', 'model-orb'));
@@ -401,7 +417,7 @@ function applyState(next) {
 }
 
 document.querySelectorAll('[data-page]').forEach((button) => button.addEventListener('click', () => showPage(button.dataset.page)));
-document.querySelector('.brand').addEventListener('click', (event) => { event.preventDefault(); showPage('research'); });
+document.querySelector('.brand').addEventListener('click', (event) => { event.preventDefault(); showPage('build'); });
 $('view-evidence').addEventListener('click', () => showPage('evidence'));
 $('provider-select').addEventListener('change', () => {
   // A filter for the previous provider should not hide a newly selected catalog.
@@ -417,28 +433,50 @@ $('research-form').addEventListener('submit', async (event) => {
   const spec = { title: 'Heat-sink design study', objective: String(form.get('objective')).trim(), conductivityWmK: 205, seed: 42, useCloud: $('use-ai').checked };
   for (const key of ['heatLoadW', 'ambientC', 'convectionWm2K', 'budget', 'widthMm', 'depthMm', 'maxHeightMm', 'maxMassG', 'maxBaseC']) spec[key] = Number(form.get(key));
   running = true;
+  researchUsesCloud = spec.useCloud;
+  researchStarted = Date.now();
+  clearInterval(researchTimer);
+  researchTimer = setInterval(updateResearchElapsed, 1000);
+  $('run-cancel').hidden = !spec.useCloud;
+  $('run-cancel').disabled = !spec.useCloud;
   document.body.classList.add('busy');
   $('run-button').disabled = true;
   $('run-button').textContent = spec.useCloud ? 'Requesting & checking…' : 'Computing & checking…';
   $('run-message').hidden = false;
   $('run-message').classList.remove('error');
   $('run-message').textContent = spec.useCloud ? 'Sending the specification to your selected provider, then checking bounded proposals. Model output cannot execute code.' : 'Evaluating constrained designs and checking numerical agreement. Every outcome will be recorded.';
+  renderResearchProgress({ status: spec.useCloud ? 'waiting' : 'validating', message: spec.useCloud ? 'The model request allows up to five minutes. Reasoning can take time before a complete design response arrives; you can cancel the request.' : 'Running the bounded numerical search locally.' });
   try {
     const run = await api.runResearch(spec);
     renderResults(run); renderLatest(run);
     await refreshEvidence();
     $('run-message').textContent = run.best ? `Run recorded. ${run.summary?.passed ?? 0} designs passed the declared checks. Predictions still require physical validation.` : 'Run recorded. No candidate passed every constraint; inspect the failed outcomes.';
+    renderResearchProgress({ status: 'complete', message: 'Candidate calculations and evidence recording completed.' });
+    $('research-progress-stage').textContent = 'Experiment recorded';
     toast('Experiment completed and evidence recorded.');
     $('results-panel').scrollIntoView({ block: 'start', behavior: 'smooth' });
   } catch (error) {
-    $('run-message').classList.add('error');
+    const cancelled = /cancelled|canceled/i.test(message(error));
+    $('run-message').classList.toggle('error', !cancelled);
     $('run-message').textContent = message(error);
-    toast(message(error), true);
+    renderResearchProgress({ status: cancelled ? 'cancelled' : 'error', message: message(error) });
+    toast(message(error), !cancelled);
   } finally {
     running = false; document.body.classList.remove('busy');
+    clearInterval(researchTimer);
+    $('run-cancel').disabled = true;
+    $('run-cancel').hidden = true;
     $('run-button').disabled = false; $('run-button').replaceChildren(document.createTextNode('Run experiment '), node('span', '↗'));
     renderUpdates(state.update);
   }
+});
+$('run-cancel').addEventListener('click', async () => {
+  if (!running || !researchUsesCloud) return;
+  $('run-cancel').disabled = true;
+  try {
+    await api.cancelResearch();
+    renderResearchProgress({ status: 'cancelled', message: 'Cancellation requested. Waiting for the provider connection to stop.' });
+  } catch (error) { toast(message(error), true); if (running) $('run-cancel').disabled = false; }
 });
 $('provider-form').addEventListener('submit', async (event) => {
   event.preventDefault();
@@ -480,6 +518,7 @@ $('install-update').addEventListener('click', async () => {
 });
 
 async function initialize() {
+  await initializeBuildStudio({ api, showPage, toast });
   if (!api) {
     $('run-button').disabled = true;
     $('run-message').hidden = false;
@@ -491,6 +530,7 @@ async function initialize() {
   try {
     if (typeof api.onUpdate === 'function') api.onUpdate(renderUpdates);
     if (typeof api.onCatalogChange === 'function') api.onCatalogChange(applyCatalogChange);
+    if (typeof api.onResearchProgress === 'function') api.onResearchProgress(progress => { if (running) renderResearchProgress(progress); });
     applyState(await api.getState());
     await refreshEvidence();
   } catch (error) { toast(`Could not initialize workspace: ${message(error)}`, true); }

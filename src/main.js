@@ -1,22 +1,30 @@
-import { app, BrowserWindow, dialog, ipcMain, safeStorage, session } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, safeStorage, session, protocol } from 'electron';
 import updaterPackage from 'electron-updater';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import path from 'node:path';
 import { writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { SettingsStore } from './settings.js';
 import { UpdateManager } from './updates.js';
 import { EvidenceLedger } from './core/ledger.js';
 import { DEFAULT_SPEC, validateSpec } from './core/research.js';
-import { listProviders, discoverModels, generateProposals } from './providers/index.js';
+import { listProviders, discoverModels, generateProposals, generateProject } from './providers/index.js';
 import { runComputation } from './runner.js';
 import { CatalogService, CATALOG_REFRESH_MS } from './catalogs.js';
+import { ProjectStore } from './builds/store.js';
+import { createDemoProject } from './builds/project.js';
+import { createPreviewHandler } from './preview.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const rendererURL = pathToFileURL(path.join(here, 'renderer/index.html')).href;
 const APP_UPDATE_INTERVAL = 6 * 60 * 60 * 1000;
-let mainWindow, store, ledger, updates, providerSession, catalogs;
+let mainWindow, store, ledger, updates, providerSession, catalogs, projects;
 let running = false;
+let buildController = null;
+let researchController = null;
 const providers = listProviders();
+const previewProjects = new Map();
+protocol.registerSchemesAsPrivileged([{ scheme: 'inventor-preview', privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true } }]);
 // Test-only data isolation is unavailable in distributed applications.
 if (!app.isPackaged && process.env.ARTIFICIAL_INVENTOR_DATA_DIR) {
   app.setPath('userData', path.resolve(process.env.ARTIFICIAL_INVENTOR_DATA_DIR));
@@ -66,7 +74,13 @@ async function evidenceState() {
 async function start() {
   store = new SettingsStore(app.getPath('userData'), safeStorage);
   await store.load();
+  if (store.data.buildDraft?.status === 'started') {
+    store.data.buildDraft.status = 'interrupted';
+    await store.persist();
+  }
   ledger = new EvidenceLedger(path.join(app.getPath('userData'), 'evidence'));
+  projects = new ProjectStore(path.join(app.getPath('userData'), 'projects'));
+  protocol.handle('inventor-preview', createPreviewHandler(async id => previewProjects.get(id)));
   providerSession = session.fromPartition('provider-transport');
   providerSession.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
   // Chromium networking honors OS trust and proxy configuration; this explicit
@@ -80,7 +94,7 @@ async function start() {
   // No browser-origin requests are necessary. All provider calls use fixed main-process adapters.
   session.defaultSession.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
   session.defaultSession.setPermissionCheckHandler(() => false);
-  session.defaultSession.webRequest.onBeforeRequest((details, callback) => callback({ cancel: !details.url.startsWith('file://') && !details.url.startsWith('devtools://') }));
+  session.defaultSession.webRequest.onBeforeRequest((details, callback) => callback({ cancel: !['file:', 'devtools:', 'inventor-preview:'].includes(new URL(details.url).protocol) }));
   register('state', async () => {
     const evidence = await evidenceState();
     return {
@@ -91,9 +105,68 @@ async function start() {
       update: updates.state, running,
       credentialStorage: store.canEncrypt() ? 'os-encrypted' : 'session-only',
       catalogRefreshMinutes: CATALOG_REFRESH_MS / 60_000,
+      buildDraft: store.data.buildDraft ?? null,
     };
   });
   register('evidence', evidenceState);
+  register('projects', () => projects.list());
+  register('build', async input => {
+    if (buildController || running) throw new Error('Wait for the current operation to finish, or cancel it first.');
+    if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('A project goal is required.');
+    const { objective, kind = 'web-app', demo = false, timeoutMs = 600_000 } = input;
+    if (typeof objective !== 'string' || !objective.trim() || objective.length > 6000) throw new Error('Describe the project in 1–6000 characters.');
+    if (!['web-app', 'code-project'].includes(kind) || typeof demo !== 'boolean') throw new Error('Choose a supported project type.');
+    if (![180_000, 300_000, 600_000].includes(timeoutMs)) throw new Error('Choose a supported response time limit.');
+    const controller = new AbortController();
+    buildController = controller;
+    const startedAt = Date.now();
+    const jobId = randomUUID();
+    const progress = value => mainWindow?.webContents.send('inventor:build-progress', { ...value, jobId, elapsedMs: Date.now() - startedAt });
+    try {
+      store.data.buildDraft = { objective, kind, timeoutMs, jobId, status: 'started', startedAt: new Date().toISOString() };
+      await store.persist();
+      progress({ status: 'waiting', message: demo ? 'Creating the local example project…' : 'Waiting for the selected cloud model. Your task is saved locally.' });
+      let generated, generator;
+      if (demo) {
+        generated = createDemoProject();
+        generator = { kind: 'offline-example', limitation: 'Demonstration project, not generated by a cloud model.' };
+      } else {
+        const selection = await requireSelectedModel(controller.signal);
+        const result = await generateProject({ ...selection, key: store.getKey(selection.providerId), objective, kind, signal: controller.signal, onProgress: progress }, { timeoutMs, fetchImpl: (url, options) => providerSession.fetch(url, options) });
+        generated = result.project;
+        generator = { providerId: result.providerId, model: result.model, generatedAt: result.generatedAt };
+      }
+      if (controller.signal.aborted) throw new Error('Build cancelled. The task is saved for another attempt.');
+      progress({ status: 'validating', message: 'Checking project paths, file limits, JSON and JavaScript syntax. No generated program runs in the main process.' });
+      const project = await projects.save(generated, { objective, generator, kind: demo ? 'web-app' : kind });
+      store.data.buildDraft.status = 'completed';
+      store.data.buildDraft.projectId = project.id;
+      await store.persist();
+      progress({ status: 'complete', message: project.verification.passed ? 'Project saved. Implemented static checks passed; runtime behavior still needs testing.' : 'Project saved with validation failures. Review the reported problems before using it.' });
+      return project;
+    } catch (error) {
+      if (store.data.buildDraft?.jobId === jobId) {
+        store.data.buildDraft.status = controller.signal.aborted ? 'cancelled' : 'failed';
+        await store.persist().catch(() => {});
+      }
+      progress({ status: controller.signal.aborted ? 'cancelled' : 'error', message: controller.signal.aborted ? 'Build cancelled. The task remains saved locally.' : 'Generation failed. The task remains saved locally for retry.' });
+      throw error;
+    } finally { buildController = null; }
+  });
+  register('cancel-build', () => { buildController?.abort(); return { cancelled: Boolean(buildController) }; });
+  register('preview-project', async id => {
+    const project = await projects.get(id);
+    if (project.kind !== 'web-app') throw new Error('Only static browser projects have an in-app preview. Export other projects to their documented toolchain.');
+    previewProjects.clear();
+    previewProjects.set(project.id, project);
+    return { url: `inventor-preview://p-${project.id}/index.html` };
+  });
+  register('export-project', async id => {
+    await projects.get(id);
+    const result = await dialog.showOpenDialog(mainWindow, { title: 'Choose a folder for a new project directory', properties: ['openDirectory', 'createDirectory'] });
+    if (result.canceled || !result.filePaths[0]) return { canceled: true };
+    return { canceled: false, ...await projects.export(id, result.filePaths[0]) };
+  });
   register('save-key', async input => {
     if (!input || typeof input !== 'object') throw new Error('Provider details are required.');
     const id = provider(input.providerId);
@@ -119,23 +192,21 @@ async function start() {
     return store.data.selectedModel;
   });
   register('research', async input => {
-    if (running) throw new Error('A research run is already in progress.');
+    if (running || buildController) throw new Error('Wait for the current operation to finish, or cancel it first.');
     if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('A research specification is required.');
     const { useCloud = false, ...fields } = input;
     if (typeof useCloud !== 'boolean') throw new Error('Cloud proposal permission must be explicit.');
     const spec = validateSpec(fields);
     running = true;
+    researchController = new AbortController();
     let started = false;
     try {
       await ledger.append('research.started', { spec, useCloud });
       started = true;
       let generation = null;
       if (useCloud) {
-        const selection = store.data.selectedModel;
-        if (!selection) throw new Error('Connect and select a cloud model first, or run the offline search.');
-        if (!catalogs.fresh(selection.providerId)) await catalogs.refresh(selection.providerId);
-        if (!store.data.catalogs[selection.providerId].models.some(item => item.id === selection.model)) throw new Error('The selected model is no longer listed. Choose another model explicitly.');
-        generation = await generateProposals({ ...selection, key: store.getKey(selection.providerId), spec }, { fetchImpl: (url, options) => providerSession.fetch(url, options) });
+        const selection = await requireSelectedModel(researchController.signal);
+        generation = await generateProposals({ ...selection, key: store.getKey(selection.providerId), spec, signal: researchController.signal, onProgress: value => mainWindow?.webContents.send('inventor:research-progress', value) }, { fetchImpl: (url, options) => providerSession.fetch(url, options) });
         await ledger.append('proposal.received', generation);
       }
       const run = await runComputation(spec, generation?.proposals ?? []);
@@ -146,8 +217,9 @@ async function start() {
     } catch (error) {
       if (started) await ledger.append('research.failed', { message: error.message, spec }).catch(() => {});
       throw error;
-    } finally { running = false; }
+    } finally { running = false; researchController = null; }
   });
+  register('cancel-research', () => { researchController?.abort(); return { cancelled: Boolean(researchController) }; });
   register('export', async runId => {
     if (runId !== undefined && runId !== null && (typeof runId !== 'string' || runId.length > 100)) throw new Error('Invalid research identifier.');
     const records = await ledger.read();
@@ -160,13 +232,33 @@ async function start() {
     return { canceled: false, path: result.filePath };
   });
   register('updates', () => updates.check());
-  register('install-update', () => updates.install());
+  register('install-update', async () => {
+    if (running || buildController) throw new Error('Finish or cancel the active task before installing an update.');
+    await store.writes;
+    return updates.install();
+  });
   createWindow();
   // Catalog refresh discovers new IDs without silently changing a qualified model.
   void catalogs.refreshConfigured();
   void updates.check();
   setInterval(() => { void catalogs.refreshConfigured(); }, CATALOG_REFRESH_MS).unref();
   setInterval(() => { void updates.check(); }, APP_UPDATE_INTERVAL).unref();
+}
+async function requireSelectedModel(signal) {
+  const selection = store.data.selectedModel && { ...store.data.selectedModel };
+  if (!selection) throw new Error('Connect and select a cloud model first, or use the explicit offline example.');
+  if (!catalogs.fresh(selection.providerId)) {
+    const refresh = catalogs.refresh(selection.providerId);
+    await new Promise((resolve, reject) => {
+      const abort = () => reject(new Error('Model request cancelled. The task remains saved locally.'));
+      if (signal?.aborted) return abort();
+      signal?.addEventListener('abort', abort, { once: true });
+      refresh.then(resolve, reject).finally(() => signal?.removeEventListener('abort', abort));
+    });
+  }
+  if (signal?.aborted) throw new Error('Model request cancelled. The task remains saved locally.');
+  if (!store.data.catalogs[selection.providerId]?.models.some(item => item.id === selection.model)) throw new Error('The selected model is no longer listed. Choose another model explicitly.');
+  return selection;
 }
 function createWindow() {
   mainWindow = new BrowserWindow({

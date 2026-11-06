@@ -1,3 +1,11 @@
+# 0.2.0
+
+Build studio now generates and exports real multi-file code projects. Static browser apps can run in an operator-started isolated preview; other supported source languages are exported with explicit validation limits. A working offline Idea Board demonstrates file inspection, preview interaction and export.
+
+Model requests stream progress, distinguish reasoning from final output, support cancellation and use five-minute thermal / ten-minute project deadlines. Tasks are saved before generation and restored after failed, cancelled or interrupted requests, without automatic paid retries. Provider refusals, output limits and incomplete streams remain distinct failures.
+
+Release publishing explicitly uploads required files and verifies the downloaded installer checksum, with bounded retries for propagation. Existing catalog freshness fixes and canonical repository settings are retained.
+
 # 0.1.2
 
 Use the renamed canonical GitHub repository `AaronGrace978/Artificial-Inventor` for publishing and update checks. Includes all 0.1.1 model-catalog fixes below.
