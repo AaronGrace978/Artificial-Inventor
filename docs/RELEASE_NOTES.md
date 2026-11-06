@@ -1,3 +1,7 @@
+# 0.1.2
+
+Use the renamed canonical GitHub repository `AaronGrace978/Artificial-Inventor` for publishing and update checks. Includes all 0.1.1 model-catalog fixes below.
+
 # 0.1.1
 
 New cloud model IDs can now appear immediately in the open model list when a provider catalog refreshes. Previously, background updates could remain invisible until the user manually refreshed the page.

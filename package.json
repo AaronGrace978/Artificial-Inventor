@@ -1,6 +1,6 @@
 {
   "name": "artificial-inventor",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "A bounded research workbench with evidence-gated AI proposals",
   "private": true,
   "type": "module",
@@ -32,7 +32,7 @@
     "asar": true,
     "files": ["src/**/*", "resources/icon.png", "package.json"],
     "directories": { "output": "dist" },
-    "publish": [{ "provider": "github", "owner": "AaronGrace978", "repo": "Artificial-Inventor-", "releaseType": "release" }],
+    "publish": [{ "provider": "github", "owner": "AaronGrace978", "repo": "Artificial-Inventor", "releaseType": "release" }],
     "win": { "icon": "resources/icon.ico", "target": [{ "target": "nsis", "arch": ["x64"] }], "artifactName": "Artificial-Inventor-Setup-${version}-${arch}.${ext}" },
     "nsis": { "oneClick": false, "allowToChangeInstallationDirectory": true, "perMachine": false, "deleteAppDataOnUninstall": false },
     "linux": { "target": "dir", "category": "Science" }
